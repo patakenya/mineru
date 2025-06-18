@@ -15,10 +15,17 @@ if (!isset($_SESSION['csrf_token'])) {
 
 // Fetch user data
 $user_id = $_SESSION['user_id'];
-$stmt = $pdo->prepare("SELECT full_name, email, account_status, referral_count, referral_code FROM users WHERE user_id = ?");
-$stmt->execute([$user_id]);
-$user = $stmt->fetch();
-if (!$user || $user['account_status'] !== 'active') {
+try {
+    $stmt = $pdo->prepare("SELECT full_name, email, account_status, referral_code FROM users WHERE user_id = ?");
+    $stmt->execute([$user_id]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$user || $user['account_status'] !== 'active') {
+        session_destroy();
+        header('Location: login.php');
+        exit;
+    }
+} catch (PDOException $e) {
+    error_log('Referrals Error: ' . $e->getMessage());
     session_destroy();
     header('Location: login.php');
     exit;
@@ -35,14 +42,15 @@ if (empty($user['referral_code'])) {
 // Generate referral link
 $referral_link = "http://localhost/miner/register.php?ref=" . urlencode($user['referral_code']);
 
-// Fetch referred users
+// Fetch referred users and count
 $stmt = $pdo->prepare("SELECT u.user_id, u.full_name, u.email, u.account_status, r.created_at 
                        FROM referrals r 
-                       JOIN users u ON r.referred_id = u.user_id 
+                       JOIN users u ON r.referred_user_id = u.user_id 
                        WHERE r.referrer_id = ? 
                        ORDER BY r.created_at DESC");
 $stmt->execute([$user_id]);
-$referred_users = $stmt->fetchAll();
+$referred_users = $stmt->fetchAll(PDO::FETCH_ASSOC);
+$referral_count = count($referred_users);
 
 // Fetch referral transactions
 $stmt = $pdo->prepare("SELECT transaction_id, amount, method, status, transaction_hash, created_at 
@@ -50,27 +58,14 @@ $stmt = $pdo->prepare("SELECT transaction_id, amount, method, status, transactio
                        WHERE user_id = ? AND type = 'referral' 
                        ORDER BY created_at DESC LIMIT 5");
 $stmt->execute([$user_id]);
-$referral_transactions = $stmt->fetchAll();
+$referral_transactions = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Calculate total referral earnings
 $stmt = $pdo->prepare("SELECT SUM(amount) as total_earnings 
                        FROM transactions 
                        WHERE user_id = ? AND type = 'referral' AND status = 'completed'");
 $stmt->execute([$user_id]);
-$total_earnings = $stmt->fetch()['total_earnings'] ?? 0.00;
-
-// Handle copy link form (for CSRF consistency, though handled by JS)
-$error = '';
-$success = '';
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['copy_link'])) {
-    // Validate CSRF token
-    if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
-        $error = 'Invalid CSRF token. Please try again.';
-        error_log('CSRF Token Mismatch: Submitted=' . ($_POST['csrf_token'] ?? 'none') . ', Expected=' . $_SESSION['csrf_token']);
-    } else {
-        $success = 'Referral link copied to clipboard!';
-    }
-}
+$total_earnings = $stmt->fetch(PDO::FETCH_ASSOC)['total_earnings'] ?? 0.00;
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -97,26 +92,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['copy_link'])) {
                 <div class="flex flex-wrap items-center justify-between">
                     <div>
                         <h1 class="text-2xl font-semibold text-gray-800 mb-2">Referrals</h1>
-                        <p class="text-gray-600 text-sm max-w-xl">Invite friends to CryptoMiner ERP and earn rewards for each successful referral.</p>
+                        <p class="text-gray-600 text-sm max-w-xl">Invite friends to CryptoMiner ERP and earn rewards for each successful referral. Three active referrals are required to withdraw funds via MPESA.</p>
                     </div>
                     <a href="wallet.php" class="bg-primary text-white px-5 py-2.5 rounded-button font-medium hover:bg-blue-600 transition-colors whitespace-nowrap">
                         <i class="ri-wallet-line mr-1"></i> Wallet
                     </a>
                 </div>
-                
-                <?php if ($error): ?>
-                    <div class="mt-4 p-3 bg-red-50 text-red-600 text-sm rounded-button flex items-center">
-                        <i class="ri-error-warning-line mr-2"></i>
-                        <?php echo htmlspecialchars($error); ?>
-                    </div>
-                <?php endif; ?>
-                
-                <?php if ($success): ?>
-                    <div class="mt-4 p-3 bg-green-50 text-green-600 text-sm rounded-button flex items-center">
-                        <i class="ri-check-line mr-2"></i>
-                        <?php echo htmlspecialchars($success); ?>
-                    </div>
-                <?php endif; ?>
             </div>
         </section>
 
@@ -130,12 +111,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['copy_link'])) {
                         <h3 class="text-sm font-medium text-gray-600 mb-2">Your Referral Link</h3>
                         <div class="flex items-center space-x-2">
                             <input type="text" id="referralLink" value="<?php echo htmlspecialchars($referral_link); ?>" readonly class="block w-full py-2 px-3 border border-gray-300 rounded-button text-sm bg-gray-50 truncate">
-                            <form method="POST" action="">
-                                <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
-                                <button type="submit" name="copy_link" onclick="copyToClipboard()" class="bg-primary text-white px-4 py-2 rounded-button font-medium hover:bg-blue-600 transition-colors whitespace-nowrap">
-                                    <i class="ri-clipboard-line mr-1"></i> Copy
-                                </button>
-                            </form>
+                            <button id="copyLinkBtn" class="bg-primary text-white px-4 py-2 rounded-button font-medium hover:bg-blue-600 transition-colors whitespace-nowrap">
+                                <i class="ri-clipboard-line mr-1"></i> Copy
+                            </button>
                         </div>
                         <p class="mt-2 text-xs text-gray-500">Share this link to invite friends and earn rewards.</p>
                     </div>
@@ -147,7 +125,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['copy_link'])) {
                                     <i class="ri-user-add-line text-primary text-2xl mr-2"></i>
                                     <h3 class="text-sm font-medium text-gray-600">Total Referrals</h3>
                                 </div>
-                                <p class="text-2xl font-bold text-primary mt-2"><?php echo $user['referral_count']; ?></p>
+                                <p class="text-2xl font-bold text-primary mt-2"><?php echo $referral_count; ?></p>
                             </div>
                             <div class="p-4 bg-green-50 rounded-lg">
                                 <div class="flex items-center">
@@ -263,15 +241,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['copy_link'])) {
     </main>
 
     <?php include 'footer.php'; ?>
-
-    <script>
-        function copyToClipboard() {
-            const link = document.getElementById('referralLink');
-            link.select();
-            document.execCommand('copy');
-            alert('Referral link copied to clipboard!');
-        }
-    </script>
     <script src="scripts.js"></script>
 </body>
 </html>

@@ -8,19 +8,26 @@ $balance = ['available_balance' => 0.00];
 $is_logged_in = isset($_SESSION['user_id']);
 
 if ($is_logged_in) {
-    // Fetch user data
-    $user_id = $_SESSION['user_id'];
-    $stmt = $pdo->prepare("SELECT full_name, email, account_status FROM users WHERE user_id = ?");
-    $stmt->execute([$user_id]);
-    $user = $stmt->fetch();
-
-    // Fetch balance data
-    if ($user && $user['account_status'] === 'active') {
-        $stmt = $pdo->prepare("SELECT available_balance FROM user_balances WHERE user_id = ?");
+    try {
+        // Fetch user data
+        $user_id = $_SESSION['user_id'];
+        $stmt = $pdo->prepare("SELECT full_name, email, account_status, phone_number FROM users WHERE user_id = ?");
         $stmt->execute([$user_id]);
-        $balance = $stmt->fetch() ?: ['available_balance' => 0.00];
-    } else {
-        // Invalidate session for non-active or invalid users
+        $user = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        // Fetch balance data
+        if ($user && $user['account_status'] === 'active') {
+            $stmt = $pdo->prepare("SELECT available_balance FROM user_balances WHERE user_id = ?");
+            $stmt->execute([$user_id]);
+            $balance = $stmt->fetch(PDO::FETCH_ASSOC) ?: ['available_balance' => 0.00];
+        } else {
+            // Invalidate session for non-active or invalid users
+            session_destroy();
+            header('Location: login.php');
+            exit;
+        }
+    } catch (PDOException $e) {
+        error_log('Header Error: ' . $e->getMessage());
         session_destroy();
         header('Location: login.php');
         exit;
@@ -37,6 +44,7 @@ if ($is_logged_in) {
                     <a href="miners.php" class="text-<?php echo basename($_SERVER['PHP_SELF']) === 'miners.php' ? 'primary font-medium' : 'gray-600 hover:text-primary'; ?> transition-colors">Miners</a>
                     <a href="referrals.php" class="text-<?php echo basename($_SERVER['PHP_SELF']) === 'referrals.php' ? 'primary font-medium' : 'gray-600 hover:text-primary'; ?> transition-colors">Referrals</a>
                     <a href="wallet.php" class="text-<?php echo basename($_SERVER['PHP_SELF']) === 'wallet.php' ? 'primary font-medium' : 'gray-600 hover:text-primary'; ?> transition-colors">Wallet</a>
+                    <a href="withdraw.php" class="text-<?php echo basename($_SERVER['PHP_SELF']) === 'withdraw.php' ? 'primary font-medium' : 'gray-600 hover:text-primary'; ?> transition-colors">Withdraw</a>
                     <a href="contact.php" class="text-<?php echo basename($_SERVER['PHP_SELF']) === 'contact.php' ? 'primary font-medium' : 'gray-600 hover:text-primary'; ?> transition-colors">Support</a>
                 <?php else: ?>
                     <a href="index.php" class="text-<?php echo basename($_SERVER['PHP_SELF']) === 'index.php' ? 'primary font-medium' : 'gray-600 hover:text-primary'; ?> transition-colors">Home</a>
@@ -54,25 +62,25 @@ if ($is_logged_in) {
                 </div>
                 
                 <div class="relative">
-                    <button id="userMenuButton" class="flex items-center space-x-2 focus:outline-none">
+                    <button id="userMenuButton" class="flex items-center space-x-2 focus:outline-none" aria-label="User menu" aria-haspopup="true" aria-expanded="false">
                         <div class="w-10 h-10 rounded-full bg-gray-200 flex items-center justify-center overflow-hidden">
-                            <img src="https://readdy.ai/api/search-image?query=professional%20headshot%20of%20a%20young%20man%20with%20short%20hair%2C%20neutral%20expression%2C%20business%20attire%2C%20high%20quality%20professional%20photo%2C%20linkedin%20profile%20picture%20style&width=100&height=100&seq=1&orientation=squarish" alt="User" class="w-full h-full object-cover">
+                            <span class="text-sm font-medium text-gray-600"><?php echo htmlspecialchars(substr($user['full_name'], 0, 1)); ?></span>
                         </div>
                         <div class="hidden md:block text-left">
                             <p class="text-sm font-medium text-gray-700"><?php echo htmlspecialchars($user['full_name']); ?></p>
-                            <p class="text-xs text-gray-500">Active User</p>
+                            <p class="text-xs text-gray-500"><?php echo $user['phone_number'] ? htmlspecialchars($user['phone_number']) : 'No phone registered'; ?></p>
                         </div>
                         <div class="w-5 h-5 flex items-center justify-center text-gray-400">
                             <i class="ri-arrow-down-s-line"></i>
                         </div>
                     </button>
                     
-                    <div id="userMenu" class="absolute right-0 mt-2 w-48 bg-white rounded shadow-lg py-1 hidden">
-                        <a href="profile.php" class="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-100">Profile</a>
-                        <a href="settings.php" class="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-100">Settings</a>
-                        <a href="security.php" class="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-100">Security</a>
+                    <div id="userMenu" class="absolute right-0 mt-2 w-48 bg-white rounded shadow-lg py-1 hidden" role="menu" aria-labelledby="userMenuButton">
+                        <a href="profile.php" class="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-100" role="menuitem">Profile</a>
+                        <a href="settings.php" class="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-100" role="menuitem">Settings</a>
+                        <a href="security.php" class="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-100" role="menuitem">Security</a>
                         <div class="border-t border-gray-100"></div>
-                        <a href="logout.php" class="block px-4 py-2 text-sm text-red-600 hover:bg-gray-100">Sign out</a>
+                        <a href="logout.php" class="block px-4 py-2 text-sm text-red-600 hover:bg-gray-100" role="menuitem">Sign out</a>
                     </div>
                 </div>
             <?php else: ?>
@@ -80,7 +88,7 @@ if ($is_logged_in) {
                 <a href="register.php" class="bg-primary text-white px-4 py-2 rounded-button font-medium hover:bg-blue-600 transition-colors whitespace-nowrap">Sign Up</a>
             <?php endif; ?>
             
-            <button class="md:hidden w-10 h-10 flex items-center justify-center text-gray-500" id="mobileMenuButton">
+            <button class="md:hidden w-10 h-10 flex items-center justify-center text-gray-500" id="mobileMenuButton" aria-label="Toggle mobile menu">
                 <i class="ri-menu-line text-xl"></i>
             </button>
         </div>
@@ -94,6 +102,10 @@ if ($is_logged_in) {
                 <a href="miners.php" class="block py-2 text-<?php echo basename($_SERVER['PHP_SELF']) === 'miners.php' ? 'primary font-medium' : 'gray-600'; ?>">Miners</a>
                 <a href="referrals.php" class="block py-2 text-<?php echo basename($_SERVER['PHP_SELF']) === 'referrals.php' ? 'primary font-medium' : 'gray-600'; ?>">Referrals</a>
                 <a href="wallet.php" class="block py-2 text-<?php echo basename($_SERVER['PHP_SELF']) === 'wallet.php' ? 'primary font-medium' : 'gray-600'; ?>">Wallet</a>
+                <a href="withdraw.php" class="block py-2 text-<?php echo basename($_SERVER['PHP_SELF']) === 'withdraw.php' ? 'primary font-medium' : 'gray-600'; ?>">Withdraw</a>
+                <a href="profile.php" class="block py-2 text-<?php echo basename($_SERVER['PHP_SELF']) === 'profile.php' ? 'primary font-medium' : 'gray-600'; ?>">Profile</a>
+                <a href="settings.php" class="block py-2 text-<?php echo basename($_SERVER['PHP_SELF']) === 'settings.php' ? 'primary font-medium' : 'gray-600'; ?>">Settings</a>
+                <a href="security.php" class="block py-2 text-<?php echo basename($_SERVER['PHP_SELF']) === 'security.php' ? 'primary font-medium' : 'gray-600'; ?>">Security</a>
                 <a href="contact.php" class="block py-2 text-<?php echo basename($_SERVER['PHP_SELF']) === 'contact.php' ? 'primary font-medium' : 'gray-600'; ?>">Support</a>
                 <div class="flex items-center bg-blue-50 rounded-full px-4 py-2 mt-2">
                     <span class="text-xs text-gray-500 mr-2">Balance:</span>

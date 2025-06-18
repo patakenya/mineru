@@ -17,7 +17,7 @@ if (!isset($_SESSION['csrf_token'])) {
 $user_id = $_SESSION['user_id'];
 $stmt = $pdo->prepare("SELECT full_name, email, account_status FROM users WHERE user_id = ?");
 $stmt->execute([$user_id]);
-$user = $stmt->fetch();
+$user = $stmt->fetch(PDO::FETCH_ASSOC);
 if (!$user || $user['account_status'] !== 'active') {
     session_destroy();
     header('Location: login.php');
@@ -27,17 +27,17 @@ if (!$user || $user['account_status'] !== 'active') {
 // Fetch balance data
 $stmt = $pdo->prepare("SELECT available_balance FROM user_balances WHERE user_id = ?");
 $stmt->execute([$user_id]);
-$balance = $stmt->fetch() ?: ['available_balance' => 0.00];
+$balance = $stmt->fetch(PDO::FETCH_ASSOC) ?: ['available_balance' => 0.00];
 
 // Fetch mining packages
 $stmt = $pdo->prepare("SELECT package_id, name, price, daily_profit, duration_days, daily_return_percentage, is_active FROM mining_packages WHERE is_active = TRUE ORDER BY price ASC");
 $stmt->execute();
-$mining_packages = $stmt->fetchAll();
+$mining_packages = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Fetch user miners
 $stmt = $pdo->prepare("SELECT um.miner_id, mp.name, mp.price, mp.daily_profit, um.purchase_date, um.status, um.days_remaining, mp.duration_days FROM user_miners um JOIN mining_packages mp ON um.package_id = mp.package_id WHERE um.user_id = ? ORDER BY um.purchase_date DESC");
 $stmt->execute([$user_id]);
-$user_miners = $stmt->fetchAll();
+$user_miners = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Handle purchase form submission
 $error = '';
@@ -55,9 +55,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['purchase_package'])) 
             $error = 'Invalid package selected.';
         } else {
             // Fetch package details
-            $stmt = $pdo->prepare("SELECT price, is_active FROM mining_packages WHERE package_id = ?");
+            $stmt = $pdo->prepare("SELECT package_id, name, price, duration_days, is_active FROM mining_packages WHERE package_id = ?");
             $stmt->execute([$package_id]);
-            $package = $stmt->fetch();
+            $package = $stmt->fetch(PDO::FETCH_ASSOC);
             
             if (!$package || !$package['is_active']) {
                 $error = 'Selected package is not available.';
@@ -73,22 +73,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['purchase_package'])) 
 
                     // Insert miner
                     $stmt = $pdo->prepare("INSERT INTO user_miners (user_id, package_id, purchase_date, status, days_remaining) VALUES (?, ?, NOW(), 'active', ?)");
-                    $stmt->execute([$user_id, $package_id, $mining_packages[array_search($package_id, array_column($mining_packages, 'package_id'))]['duration_days']]);
+                    $stmt->execute([$user_id, $package_id, $package['duration_days']]);
 
                     // Record transaction
-                    $stmt = $pdo->prepare("INSERT INTO transactions (user_id, type, amount, method, status, created_at) VALUES (?, 'purchase', ?, 'balance', 'completed', NOW())");
-                    $stmt->execute([$user_id, -$package['price']]);
+                    $transaction_hash = 'TX_' . bin2hex(random_bytes(8));
+                    $stmt = $pdo->prepare("INSERT INTO transactions (user_id, type, amount, method, status, transaction_hash, created_at) VALUES (?, 'purchase', ?, 'balance', 'completed', ?, NOW())");
+                    $stmt->execute([$user_id, -$package['price'], $transaction_hash]);
 
                     $pdo->commit();
 
                     // Regenerate CSRF token
                     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 
-                    $success = 'Miner purchased successfully!';
+                    // Refresh balance
+                    $stmt = $pdo->prepare("SELECT available_balance FROM user_balances WHERE user_id = ?");
+                    $stmt->execute([$user_id]);
+                    $balance = $stmt->fetch(PDO::FETCH_ASSOC) ?: ['available_balance' => 0.00];
+
                     // Refresh miners list
                     $stmt = $pdo->prepare("SELECT um.miner_id, mp.name, mp.price, mp.daily_profit, um.purchase_date, um.status, um.days_remaining, mp.duration_days FROM user_miners um JOIN mining_packages mp ON um.package_id = mp.package_id WHERE um.user_id = ? ORDER BY um.purchase_date DESC");
                     $stmt->execute([$user_id]);
-                    $user_miners = $stmt->fetchAll();
+                    $user_miners = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+                    $success = "Miner '{$package['name']}' purchased successfully!";
                 } catch (Exception $e) {
                     $pdo->rollBack();
                     $error = 'Purchase failed: ' . htmlspecialchars($e->getMessage());
@@ -126,7 +133,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['purchase_package'])) 
                         <h1 class="text-2xl font-semibold text-gray-800 mb-2">Mining Packages</h1>
                         <p class="text-gray-600 text-sm max-w-xl">Purchase miners to start earning daily profits. Your available balance: <span class="font-medium text-primary">$<?php echo number_format($balance['available_balance'], 2); ?></span></p>
                     </div>
-                    <a href="deposit.php" class="bg-primary text-white px-5 py-2.5 rounded-button font-medium hover:bg-blue-600 transition-colors whitespace-nowrap">
+                    <a href="wallet.php" class="bg-primary text-white px-5 py-2.5 rounded-button font-medium hover:bg-blue-600 transition-colors whitespace-nowrap">
                         <i class="ri-arrow-down-line mr-1"></i> Deposit Funds
                     </a>
                 </div>
@@ -173,7 +180,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['purchase_package'])) 
                             <ul class="space-y-2 mb-4">
                                 <li class="flex items-center text-sm text-gray-600">
                                     <i class="ri-check-line text-green-500 mr-2"></i>
-                                    <?php echo $package['daily_return_percentage']; ?>% daily return
+                                    <?php echo number_format($package['daily_return_percentage'], 2); ?>% daily return
                                 </li>
                                 <li class="flex items-center text-sm text-gray-600">
                                     <i class="ri-check-line text-green-500 mr-2"></i>

@@ -8,64 +8,187 @@ if (!isset($_SESSION['user_id'])) {
     exit;
 }
 
-// Fetch user data
+// Generate CSRF token if not set
+if (!isset($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
+// Initialize messages
+$error = '';
+$success = '';
 $user_id = $_SESSION['user_id'];
-$stmt = $pdo->prepare("SELECT full_name, email, referral_code, account_status FROM users WHERE user_id = ?");
-$stmt->execute([$user_id]);
-$user = $stmt->fetch();
-if (!$user || $user['account_status'] !== 'active') {
+
+try {
+    // Handle miner purchase
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['purchase_miner'])) {
+        if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
+            $error = 'Invalid CSRF token. Please try again.';
+            error_log('CSRF Token Mismatch: Submitted=' . ($_POST['csrf_token'] ?? 'none') . ', Expected=' . $_SESSION['csrf_token']);
+        } else {
+            $package_id = filter_input(INPUT_POST, 'package_id', FILTER_VALIDATE_INT);
+            if ($package_id) {
+                // Fetch package details
+                $stmt = $pdo->prepare("SELECT name, price, daily_profit, duration_days FROM mining_packages WHERE package_id = ?");
+                $stmt->execute([$package_id]);
+                $package = $stmt->fetch(PDO::FETCH_ASSOC);
+                
+                if ($package) {
+                    // Fetch user balance
+                    $stmt = $pdo->prepare("SELECT available_balance FROM user_balances WHERE user_id = ? FOR UPDATE");
+                    $stmt->execute([$user_id]);
+                    $balance = $stmt->fetch(PDO::FETCH_ASSOC);
+                    if (!$balance) {
+                        $stmt = $pdo->prepare("INSERT INTO user_balances (user_id, available_balance, pending_balance, total_withdrawn) VALUES (?, 0.00, 0.00, 0.00)");
+                        $stmt->execute([$user_id]);
+                        $balance = ['available_balance' => 0.00];
+                    }
+
+                    if ($balance['available_balance'] >= $package['price']) {
+                        // Begin transaction
+                        $pdo->beginTransaction();
+                        try {
+                            // Deduct balance
+                            $stmt = $pdo->prepare("UPDATE user_balances SET available_balance = available_balance - ? WHERE user_id = ?");
+                            $stmt->execute([$package['price'], $user_id]);
+                            
+                            // Insert user miner
+                            $stmt = $pdo->prepare("INSERT INTO user_miners (user_id, package_id, purchase_date, status, days_remaining) VALUES (?, ?, NOW(), 'active', ?)");
+                            $stmt->execute([$user_id, $package_id, $package['duration_days']]);
+                            
+                            // Record transaction
+                            $transaction_hash = 'TX_PURCHASE_' . bin2hex(random_bytes(8));
+                            $stmt = $pdo->prepare("INSERT INTO transactions (user_id, type, amount, method, status, transaction_hash, created_at) VALUES (?, 'purchase', ?, 'wallet', 'completed', ?, NOW())");
+                            $stmt->execute([$user_id, -$package['price'], $transaction_hash]);
+                            
+                            $pdo->commit();
+                            $success = "Successfully purchased {$package['name']} for $" . number_format($package['price'], 2) . "!";
+                        } catch (Exception $e) {
+                            $pdo->rollBack();
+                            $error = 'Purchase failed. Please try again.';
+                            error_log('Purchase Error: ' . $e->getMessage());
+                        }
+                    } else {
+                        $error = 'Insufficient balance to purchase this miner.';
+                    }
+                } else {
+                    $error = 'Invalid mining package selected.';
+                }
+            } else {
+                $error = 'Invalid package ID.';
+            }
+        }
+    }
+
+    // Fetch user data
+    $stmt = $pdo->prepare("SELECT full_name, email, referral_code, account_status, created_at FROM users WHERE user_id = ?");
+    $stmt->execute([$user_id]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$user || $user['account_status'] !== 'active') {
+        session_destroy();
+        header('Location: login.php');
+        exit;
+    }
+
+    // Ensure referral code exists
+    if (empty($user['referral_code'])) {
+        $referral_code = strtoupper(substr(md5(uniqid(rand(), true)), 0, 10));
+        $stmt = $pdo->prepare("UPDATE users SET referral_code = ? WHERE user_id = ?");
+        $stmt->execute([$referral_code, $user_id]);
+        $user['referral_code'] = $referral_code;
+    }
+
+    // Fetch balance data
+    $stmt = $pdo->prepare("SELECT available_balance FROM user_balances WHERE user_id = ?");
+    $stmt->execute([$user_id]);
+    $balance = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$balance) {
+        $stmt = $pdo->prepare("INSERT INTO user_balances (user_id, available_balance, pending_balance, total_withdrawn) VALUES (?, 0.00, 0.00, 0.00)");
+        $stmt->execute([$user_id]);
+        $balance = ['available_balance' => 0.00];
+    }
+
+    // Fetch pending balance
+    $stmt = $pdo->prepare("SELECT SUM(amount) as pending_balance FROM transactions WHERE user_id = ? AND type = 'withdrawal' AND status = 'pending'");
+    $stmt->execute([$user_id]);
+    $pending_balance = $stmt->fetch(PDO::FETCH_ASSOC)['pending_balance'] ?: 0.00;
+
+    // Fetch total withdrawn
+    $stmt = $pdo->prepare("SELECT SUM(amount) as total_withdrawn FROM transactions WHERE user_id = ? AND type = 'withdrawal' AND status = 'completed'");
+    $stmt->execute([$user_id]);
+    $total_withdrawn = $stmt->fetch(PDO::FETCH_ASSOC)['total_withdrawn'] ?: 0.00;
+
+    // Fetch total investment
+    $stmt = $pdo->prepare("SELECT SUM(mp.price) as total_investment FROM user_miners um JOIN mining_packages mp ON um.package_id = mp.package_id WHERE um.user_id = ?");
+    $stmt->execute([$user_id]);
+    $total_investment = $stmt->fetch(PDO::FETCH_ASSOC)['total_investment'] ?: 0.00;
+
+    // Fetch active miners count
+    $stmt = $pdo->prepare("SELECT COUNT(*) as active_miners FROM user_miners WHERE user_id = ? AND status = 'active'");
+    $stmt->execute([$user_id]);
+    $active_miners = $stmt->fetch(PDO::FETCH_ASSOC)['active_miners'];
+
+    // Fetch daily earnings
+    $stmt = $pdo->prepare("SELECT SUM(mp.daily_profit) as daily_earnings FROM user_miners um JOIN mining_packages mp ON um.package_id = mp.package_id WHERE um.user_id = ? AND um.status = 'active'");
+    $stmt->execute([$user_id]);
+    $daily_earnings = $stmt->fetch(PDO::FETCH_ASSOC)['daily_earnings'] ?: 0.00;
+
+    // Fetch referral earnings and count
+    $stmt = $pdo->prepare("SELECT SUM(commission_earned) as referral_earnings, COUNT(*) as referral_count FROM referrals WHERE referrer_id = ? AND status = 'active'");
+    $stmt->execute([$user_id]);
+    $referrals = $stmt->fetch(PDO::FETCH_ASSOC);
+    $referral_earnings = $referrals['referral_earnings'] ?: 0.00;
+    $referral_count = $referrals['referral_count'];
+    $referral_progress = min($referral_count / 3 * 100, 100);
+
+    // Fetch active miners
+    $stmt = $pdo->prepare("SELECT um.miner_id, mp.name, mp.price, mp.daily_profit, um.purchase_date, um.status, um.days_remaining, mp.duration_days 
+                           FROM user_miners um JOIN mining_packages mp ON um.package_id = mp.package_id 
+                           WHERE um.user_id = ? ORDER BY um.purchase_date DESC LIMIT 5");
+    $stmt->execute([$user_id]);
+    $user_miners = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    // Fetch transactions
+    $stmt = $pdo->prepare("SELECT transaction_id, type, amount, method, status, transaction_hash, created_at 
+                           FROM transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 5");
+    $stmt->execute([$user_id]);
+    $transactions = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    // Fetch mining packages
+    $stmt = $pdo->prepare("SELECT package_id, name, price, daily_profit, daily_return_percentage, duration_days FROM mining_packages ORDER BY price ASC");
+    $stmt->execute();
+    $mining_packages = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    // Fetch earnings data for chart (last 7 days)
+    $stmt = $pdo->prepare("SELECT DATE(created_at) as date, 
+                           SUM(CASE WHEN type = 'earning' THEN amount ELSE 0 END) as daily_earnings,
+                           SUM(CASE WHEN type = 'referral' THEN amount ELSE 0 END) as referral_earnings
+                           FROM transactions 
+                           WHERE user_id = ? AND created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+                           GROUP BY DATE(created_at) 
+                           ORDER BY DATE(created_at) ASC");
+    $stmt->execute([$user_id]);
+    $earnings_data = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    // Prepare chart data
+    $chart_dates = [];
+    $chart_daily_earnings = [];
+    $chart_referral_earnings = [];
+    $start_date = new DateTime('-7 days');
+    for ($i = 0; $i < 7; $i++) {
+        $date = $start_date->format('Y-m-d');
+        $chart_dates[] = $start_date->format('M d');
+        $found = array_filter($earnings_data, fn($row) => $row['date'] === $date);
+        $found = reset($found);
+        $chart_daily_earnings[] = $found ? (float)$found['daily_earnings'] : 0.00;
+        $chart_referral_earnings[] = $found ? (float)$found['referral_earnings'] : 0.00;
+        $start_date->modify('+1 day');
+    }
+} catch (PDOException $e) {
+    error_log('Dashboard Error: ' . $e->getMessage());
     session_destroy();
     header('Location: login.php');
     exit;
 }
-
-// Fetch balance data
-$stmt = $pdo->prepare("SELECT available_balance, pending_balance, total_withdrawn FROM user_balances WHERE user_id = ?");
-$stmt->execute([$user_id]);
-$balance = $stmt->fetch() ?: ['available_balance' => 0.00, 'pending_balance' => 0.00, 'total_withdrawn' => 0.00];
-
-// Fetch total investment
-$stmt = $pdo->prepare("SELECT SUM(mp.price) as total_investment FROM user_miners um JOIN mining_packages mp ON um.package_id = mp.package_id WHERE um.user_id = ?");
-$stmt->execute([$user_id]);
-$total_investment = $stmt->fetch()['total_investment'] ?: 0.00;
-
-// Fetch active miners count
-$stmt = $pdo->prepare("SELECT COUNT(*) as active_miners FROM user_miners WHERE user_id = ? AND status = 'active'");
-$stmt->execute([$user_id]);
-$active_miners = $stmt->fetch()['active_miners'];
-
-// Fetch daily earnings
-$stmt = $pdo->prepare("SELECT SUM(mp.daily_profit) as daily_earnings FROM user_miners um JOIN mining_packages mp ON um.package_id = mp.package_id WHERE um.user_id = ? AND um.status = 'active'");
-$stmt->execute([$user_id]);
-$daily_earnings = $stmt->fetch()['daily_earnings'] ?: 0.00;
-
-// Fetch referral earnings and count
-$stmt = $pdo->prepare("SELECT SUM(commission_earned) as referral_earnings, COUNT(*) as referral_count FROM referrals WHERE referrer_id = ? AND status = 'active'");
-$stmt->execute([$user_id]);
-$referrals = $stmt->fetch();
-$referral_earnings = $referrals['referral_earnings'] ?: 0.00;
-$referral_count = $referrals['referral_count'];
-$referral_progress = min($referral_count / 3 * 100, 100); // 3 referrals needed for withdrawals
-
-// Fetch active miners
-$stmt = $pdo->prepare("SELECT um.miner_id, mp.name, mp.price, mp.daily_profit, um.purchase_date, um.status, um.days_remaining, mp.duration_days FROM user_miners um JOIN mining_packages mp ON um.package_id = mp.package_id WHERE um.user_id = ? ORDER BY um.purchase_date DESC LIMIT 5");
-$stmt->execute([$user_id]);
-$user_miners = $stmt->fetchAll();
-
-// Fetch transactions
-$stmt = $pdo->prepare("SELECT transaction_id, type, amount, method, status, transaction_hash, created_at FROM transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 5");
-$stmt->execute([$user_id]);
-$transactions = $stmt->fetchAll();
-
-// Fetch security settings
-$stmt = $pdo->prepare("SELECT two_factor_enabled, login_alerts, withdrawal_confirmations, referral_notifications, daily_earnings_reports, marketing_promotions FROM security_settings WHERE user_id = ?");
-$stmt->execute([$user_id]);
-$security = $stmt->fetch() ?: ['two_factor_enabled' => false, 'login_alerts' => true, 'withdrawal_confirmations' => true, 'referral_notifications' => true, 'daily_earnings_reports' => false, 'marketing_promotions' => false];
-
-// Fetch login activity
-$stmt = $pdo->prepare("SELECT device_type, browser, ip_address, location, login_time, status FROM login_activity WHERE user_id = ? ORDER BY login_time DESC LIMIT 3");
-$stmt->execute([$user_id]);
-$login_activity = $stmt->fetchAll();
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -87,12 +210,26 @@ $login_activity = $stmt->fetchAll();
     <?php include 'header.php'; ?>
 
     <main class="container mx-auto px-4 py-6">
+        <!-- Messages -->
+        <?php if ($error): ?>
+            <div class="mb-4 p-3 bg-red-50 text-red-600 text-sm rounded-button flex items-center">
+                <i class="ri-error-warning-line mr-2"></i>
+                <?php echo htmlspecialchars($error); ?>
+            </div>
+        <?php endif; ?>
+        <?php if ($success): ?>
+            <div class="mb-4 p-3 bg-green-50 text-green-600 text-sm rounded-button flex items-center">
+                <i class="ri-check-line mr-2"></i>
+                <?php echo htmlspecialchars($success); ?>
+            </div>
+        <?php endif; ?>
+
         <!-- Welcome Section -->
         <section class="mb-8">
             <div class="bg-white rounded-lg shadow-sm overflow-hidden">
                 <div class="relative">
                     <div class="absolute inset-0 bg-gradient-to-r from-blue-600 to-blue-400 opacity-90"></div>
-                    <div style="background-image: url('https://readdy.ai/api/search-image?query=abstract%20digital%20cryptocurrency%20mining%20concept%20with%20circuit%20board%20patterns%2C%20blue%20technology%20background%20with%20glowing%20nodes%20and%20connections%2C%20futuristic%20blockchain%20visualization%2C%20clean%20professional%20look%2C%20high%20resolution&width=1200&height=400&seq=2&orientation=landscape');" class="h-64 bg-cover bg-center"></div>
+                    <div class="h-64 bg-blue-200 bg-cover bg-center"></div>
                     <div class="absolute inset-0 flex items-center">
                         <div class="px-8 md:px-12 w-full">
                             <h1 class="text-2xl md:text-3xl font-bold text-white mb-2">Welcome, <?php echo htmlspecialchars($user['full_name']); ?>!</h1>
@@ -184,6 +321,62 @@ $login_activity = $stmt->fetchAll();
             </div>
         </section>
 
+        <!-- Mining Packages -->
+        <section class="py-12 bg-gray-50" id="miners">
+            <div class="container mx-auto px-4">
+                <h2 class="text-3xl font-semibold text-gray-800 mb-8 text-center">Our Mining Packages</h2>
+                <p class="text-center text-gray-600 text-sm mb-10 max-w-xl mx-auto">Choose a plan that fits your goals and start generating passive income today.</p>
+                
+                <?php if (empty($mining_packages)): ?>
+                    <p class="text-center text-gray-500">No mining packages available at the moment.</p>
+                <?php else: ?>
+                    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-6">
+                        <?php foreach ($mining_packages as $index => $package): ?>
+                            <div class="bg-white rounded-lg shadow-sm overflow-hidden border border-gray-100 hover:border-blue-200 transition-colors <?php echo $index === 2 ? 'ring-2 ring-blue-500 ring-opacity-20' : ''; ?>">
+                                <div class="p-4 <?php echo $index === 2 ? 'bg-gradient-to-r from-blue-600 to-blue-500 text-white' : 'bg-blue-50'; ?>">
+                                    <h3 class="text-lg font-semibold <?php echo $index === 2 ? 'text-white' : 'text-gray-800'; ?>"><?php echo htmlspecialchars($package['name']); ?></h3>
+                                    <div class="mt-2 flex items-baseline">
+                                        <span class="text-2xl font-bold <?php echo $index === 2 ? 'text-white' : 'text-primary'; ?>">$<?php echo number_format($package['price'], 2); ?></span>
+                                        <span class="text-sm <?php echo $index === 2 ? 'text-blue-100' : 'text-gray-500'; ?> ml-2">one-time</span>
+                                    </div>
+                                    <?php if ($index === 2): ?>
+                                        <div class="absolute top-0 right-0 bg-blue-700 text-white text-xs font-medium px-2 py-1 rounded-bl-lg">POPULAR</div>
+                                    <?php endif; ?>
+                                </div>
+                                <div class="p-4">
+                                    <ul class="space-y-2 mb-4">
+                                        <li class="flex items-center text-sm text-gray-600">
+                                            <i class="ri-check-line text-green-500 mr-2"></i>
+                                            <?php echo number_format($package['daily_return_percentage'], 2); ?>% daily return
+                                        </li>
+                                        <li class="flex items-center text-sm text-gray-600">
+                                            <i class="ri-check-line text-green-500 mr-2"></i>
+                                            <?php echo $package['duration_days']; ?> days duration
+                                        </li>
+                                        <li class="flex items-center text-sm text-gray-600">
+                                            <i class="ri-check-line text-green-500 mr-2"></i>
+                                            Total return: $<?php echo number_format($package['price'] * (1 + ($package['daily_return_percentage'] / 100) * $package['duration_days']), 2); ?>
+                                        </li>
+                                        <li class="flex items-center text-sm text-gray-600">
+                                            <i class="ri-check-line text-green-500 mr-2"></i>
+                                            Daily profit: $<?php echo number_format($package['daily_profit'], 2); ?>
+                                        </li>
+                                    </ul>
+                                    <form method="POST" action="">
+                                        <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
+                                        <input type="hidden" name="package_id" value="<?php echo $package['package_id']; ?>">
+                                        <button type="submit" name="purchase_miner" class="block w-full bg-primary text-white py-2.5 rounded-button font-medium hover:bg-blue-600 transition-colors text-center">
+                                            Purchase Now
+                                        </button>
+                                    </form>
+                                </div>
+                            </div>
+                        <?php endforeach; ?>
+                    </div>
+                <?php endif; ?>
+            </div>
+        </section>
+
         <!-- Active Miners -->
         <section id="miners" class="mb-8">
             <div class="bg-white rounded-lg shadow-sm p-6">
@@ -209,7 +402,7 @@ $login_activity = $stmt->fetchAll();
                             <?php if (empty($user_miners)): ?>
                                 <tr>
                                     <td colspan="5" class="px-4 py-4 text-center text-gray-500">
-                                        No active miners. <a href="miners.php" class="text-primary hover:text-blue-600">Purchase a miner now</a>.
+                                        No active miners. Purchase a miner below.
                                     </td>
                                 </tr>
                             <?php else: ?>
@@ -270,13 +463,13 @@ $login_activity = $stmt->fetchAll();
                         <div class="w-full bg-gray-200 rounded-full h-2.5">
                             <div class="bg-primary h-2.5 rounded-full" style="width: <?php echo $referral_progress; ?>%"></div>
                         </div>
-                        <p class="mt-2 text-xs text-gray-500"><?php echo 3 - $referral_count; ?> more referral<?php echo (3 - $referral_count) !== 1 ? 's' : ''; ?> to enable withdrawals</p>
+                        <p class="mt-2 text-xs text-gray-500"><?php echo 3 - $referral_count; ?> more referral<?php echo (3 - $referral_count) !== 1 ? 's' : ''; ?> to enable MPESA withdrawals</p>
                     </div>
                     
                     <div class="mb-6">
                         <h3 class="text-sm font-medium text-gray-700 mb-3">Your Referral Link</h3>
                         <div class="flex">
-                            <input type="text" value="https://cryptominer.com/ref/<?php echo htmlspecialchars($user['referral_code']); ?>" readonly class="flex-1 border border-gray-300 rounded-l-button py-2 px-3 text-sm bg-gray-50 focus:outline-none">
+                            <input type="text" id="referralLink" value="http://localhost/miner/register.php?ref=<?php echo htmlspecialchars($user['referral_code']); ?>" readonly class="flex-1 border border-gray-300 rounded-l-button py-2 px-3 text-sm bg-gray-50 focus:outline-none">
                             <button id="copyLinkBtn" class="bg-primary text-white px-4 rounded-r-button hover:bg-blue-600 transition-colors whitespace-nowrap">
                                 <i class="ri-file-copy-line"></i>
                             </button>
@@ -286,21 +479,22 @@ $login_activity = $stmt->fetchAll();
                     <div>
                         <h3 class="text-sm font-medium text-gray-700 mb-3">Share Your Link</h3>
                         <div class="flex space-x-2">
-                            <button class="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center text-blue-600 hover:bg-blue-100 transition-colors">
+                            <?php $referral_url = 'http://localhost/miner/register.php?ref=' . urlencode($user['referral_code']); ?>
+                            <a href="https://www.facebook.com/sharer/sharer.php?u=<?php echo htmlspecialchars(urlencode($referral_url)); ?>" target="_blank" class="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center text-blue-600 hover:bg-blue-100 transition-colors" aria-label="Share on Facebook">
                                 <i class="ri-facebook-fill"></i>
-                            </button>
-                            <button class="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center text-blue-400 hover:bg-blue-100 transition-colors">
+                            </a>
+                            <a href="https://twitter.com/intent/tweet?url=<?php echo htmlspecialchars(urlencode($referral_url)); ?>&text=Join%20CryptoMiner%20ERP%20and%20start%20mining!" target="_blank" class="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center text-blue-400 hover:bg-blue-100 transition-colors" aria-label="Share on Twitter">
                                 <i class="ri-twitter-fill"></i>
-                            </button>
-                            <button class="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center text-green-500 hover:bg-blue-100 transition-colors">
+                            </a>
+                            <a href="https://api.whatsapp.com/send?text=Join%20CryptoMiner%20ERP%20and%20start%20mining!%20<?php echo htmlspecialchars(urlencode($referral_url)); ?>" target="_blank" class="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center text-green-500 hover:bg-blue-100 transition-colors" aria-label="Share on WhatsApp">
                                 <i class="ri-whatsapp-fill"></i>
-                            </button>
-                            <button class="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center text-blue-700 hover:bg-blue-100 transition-colors">
+                            </a>
+                            <a href="https://t.me/share/url?url=<?php echo htmlspecialchars(urlencode($referral_url)); ?>&text=Join%20CryptoMiner%20ERP%20and%20start%20mining!" target="_blank" class="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center text-blue-700 hover:bg-blue-100 transition-colors" aria-label="Share on Telegram">
                                 <i class="ri-telegram-fill"></i>
-                            </button>
-                            <button class="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center text-red-500 hover:bg-blue-100 transition-colors">
+                            </a>
+                            <a href="mailto:?subject=Join%20CryptoMiner%20ERP!&body=Start%20mining%20with%20CryptoMiner%20ERP:%20<?php echo htmlspecialchars(urlencode($referral_url)); ?>" class="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center text-red-500 hover:bg-blue-100 transition-colors" aria-label="Share via Email">
                                 <i class="ri-mail-fill"></i>
-                            </button>
+                            </a>
                         </div>
                     </div>
                 </div>
@@ -325,7 +519,7 @@ $login_activity = $stmt->fetchAll();
                                 <?php if (empty($transactions)): ?>
                                     <tr>
                                         <td colspan="5" class="px-4 py-4 text-center text-gray-500">
-                                            No transactions yet. <a href="#wallet" class="text-primary hover:text-blue-600">Make a deposit</a>.
+                                            No transactions yet. <a href="deposit.php" class="text-primary hover:text-blue-600">Make a deposit</a>.
                                         </td>
                                     </tr>
                                 <?php else: ?>
@@ -333,8 +527,8 @@ $login_activity = $stmt->fetchAll();
                                         <tr>
                                             <td class="px-4 py-4 whitespace-nowrap">
                                                 <div class="flex items-center">
-                                                    <div class="w-8 h-8 rounded-full bg-<?php echo $tx['type'] === 'deposit' ? 'green' : ($tx['type'] === 'withdrawal' ? 'red' : 'blue'); ?>-100 flex items-center justify-center mr-3">
-                                                        <i class="ri-<?php echo $tx['type'] === 'deposit' ? 'arrow-down' : ($tx['type'] === 'withdrawal' ? 'arrow-up' : 'coins'); ?>-line text-<?php echo $tx['type'] === 'deposit' ? 'green' : ($tx['type'] === 'withdrawal' ? 'red' : 'blue'); ?>-600"></i>
+                                                    <div class="w-8 h-8 rounded-full bg-<?php echo $tx['type'] === 'deposit' ? 'green' : ($tx['type'] === 'withdrawal' ? 'red' : ($tx['type'] === 'referral' ? 'purple' : 'blue')); ?>-100 flex items-center justify-center mr-3">
+                                                        <i class="ri-<?php echo $tx['type'] === 'deposit' ? 'arrow-down' : ($tx['type'] === 'withdrawal' ? 'arrow-up' : ($tx['type'] === 'referral' ? 'user-add' : ($tx['type'] === 'purchase' ? 'shopping-cart' : 'coins'))); ?>-line text-<?php echo $tx['type'] === 'deposit' ? 'green' : ($tx['type'] === 'withdrawal' ? 'red' : ($tx['type'] === 'referral' ? 'purple' : ($tx['type'] === 'purchase' ? 'blue' : 'blue'))); ?>-600"></i>
                                                     </div>
                                                     <div>
                                                         <div class="text-sm font-medium text-gray-900"><?php echo ucfirst($tx['type']); ?></div>
@@ -386,26 +580,13 @@ $login_activity = $stmt->fetchAll();
                         <div class="flex justify-between text-sm">
                             <div>
                                 <p class="text-blue-100 mb-1">Pending</p>
-                                <p class="font-medium">$<?php echo number_format($balance['pending_balance'], 2); ?></p>
+                                <p class="font-medium">$<?php echo number_format($pending_balance, 2); ?></p>
                             </div>
                             <div>
                                 <p class="text-blue-100 mb-1">Total Withdrawn</p>
-                                <p class="font-medium">$<?php echo number_format($balance['total_withdrawn'], 2); ?></p>
+                                <p class="font-medium">$<?php echo number_format($total_withdrawn, 2); ?></p>
                             </div>
                         </div>
-                    </div>
-                    
-                    <div class="mb-4">
-                        <div class="flex justify-between items-center mb-2">
-                            <h3 class="text-sm font-medium text-gray-700">Withdrawal Status</h3>
-                            <span class="text-xs text-<?php echo $referral_count >= 3 ? 'green' : 'yellow'; ?>-600 bg-<?php echo $referral_count >= 3 ? 'green' : 'yellow'; ?>-50 px-2 py-1 rounded-full"><?php echo $referral_count; ?>/3 Referrals</span>
-                        </div>
-                        <div class="flex items-center">
-                            <div class="w-full bg-gray-200 rounded-full h-2.5">
-                                <div class="bg-<?php echo $referral_count >= 3 ? 'green' : 'yellow'; ?>-500 h-2.5 rounded-full" style="width: <?php echo $referral_progress; ?>%"></div>
-                            </div>
-                        </div>
-                        <p class="mt-2 text-xs text-gray-500"><?php echo $referral_count >= 3 ? 'Withdrawals enabled' : (3 - $referral_count) . ' more referral' . ((3 - $referral_count) !== 1 ? 's' : '') . ' needed'; ?></p>
                     </div>
                     
                     <div>
@@ -424,47 +605,29 @@ $login_activity = $stmt->fetchAll();
             
             <div class="lg:col-span-2">
                 <div class="bg-white rounded-lg shadow-sm p-6">
-                    <h2 class="text-xl font-semibold text-gray-800 mb-6">Security Overview</h2>
+                    <h2 class="text-xl font-semibold text-gray-800 mb-6">Account Overview</h2>
                     
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                         <div class="border border-gray-200 rounded-lg p-4">
                             <div class="flex items-start justify-between">
                                 <div>
-                                    <h3 class="text-lg font-medium text-gray-800 mb-1">Two-Factor Authentication</h3>
-                                    <p class="text-sm text-gray-500 mb-4">Enhance your account security</p>
+                                    <h3 class="text-lg font-medium text-gray-800 mb-1">Account Status</h3>
+                                    <p class="text-sm text-gray-500 mb-4">Your account details</p>
                                 </div>
-                                <label class="custom-switch">
-                                    <input type="checkbox" id="twoFactorToggle" <?php echo $security['two_factor_enabled'] ? 'checked' : ''; ?> disabled>
-                                    <span class="slider"></span>
-                                </label>
+                                <span class="text-xs bg-green-100 text-green-800 px-2 py-1 rounded-full"><?php echo ucfirst($user['account_status']); ?></span>
                             </div>
-                            <p class="text-xs text-gray-500">Contact <a href="contact.php" class="text-primary hover:text-blue-600">support</a> to enable 2FA.</p>
+                            <p class="text-sm text-gray-600">Email: <?php echo htmlspecialchars($user['email']); ?></p>
+                            <p class="text-sm text-gray-600">Registered: <?php echo date('M d, Y', strtotime($user['created_at'] ?? '2025-06-18')); ?></p>
+                            <a href="profile.php" class="mt-2 inline-block text-primary text-sm hover:text-blue-600">Update Profile</a>
                         </div>
                         
                         <div class="border border-gray-200 rounded-lg p-4">
                             <div class="flex items-start justify-between">
-                                <h3 class="text-lg font-medium text-gray-800 mb-1">Recent Login Activity</h3>
+                                <h3 class="text-lg font-medium text-gray-800 mb-1">Recent Activity</h3>
                                 <a href="activity.php" class="text-primary text-sm hover:text-blue-600">View All</a>
                             </div>
                             <div class="space-y-3 mt-4">
-                                <?php if (empty($login_activity)): ?>
-                                    <p class="text-sm text-gray-500">No recent activity.</p>
-                                <?php else: ?>
-                                    <?php foreach ($login_activity as $activity): ?>
-                                        <div class="flex items-center justify-between p-3 bg-<?php echo $activity['status'] === 'active' ? 'green' : 'gray'; ?>-50 rounded-lg">
-                                            <div class="flex items-center">
-                                                <div class="w-8 h-8 rounded-full bg-<?php echo $activity['status'] === 'active' ? 'green' : 'gray'; ?>-100 flex items-center justify-center mr-3">
-                                                    <i class="ri-<?php echo strpos($activity['device_type'], 'Mobile') !== false ? 'smartphone' : 'computer'; ?>-line text-<?php echo $activity['status'] === 'active' ? 'green' : 'gray'; ?>-600"></i>
-                                                </div>
-                                                <div>
-                                                    <p class="text-sm font-medium text-gray-800"><?php echo htmlspecialchars($activity['device_type']); ?></p>
-                                                    <p class="text-xs text-gray-500"><?php echo htmlspecialchars($activity['location'] ?: 'Unknown'); ?> • <?php echo htmlspecialchars(substr($activity['browser'], 0, 20)); ?> • <?php echo date('M d, Y', strtotime($activity['login_time'])); ?></p>
-                                                </div>
-                                            </div>
-                                            <span class="text-xs bg-<?php echo $activity['status'] === 'active' ? 'green' : 'gray'; ?>-100 text-<?php echo $activity['status'] === 'active' ? 'green' : 'gray'; ?>-800 px-2 py-1 rounded-full"><?php echo ucfirst($activity['status']); ?></span>
-                                        </div>
-                                    <?php endforeach; ?>
-                                <?php endif; ?>
+                                <p class="text-sm text-gray-500">No recent activity recorded.</p>
                             </div>
                         </div>
                     </div>
@@ -476,5 +639,102 @@ $login_activity = $stmt->fetchAll();
     <?php include 'footer.php'; ?>
 
     <script src="scripts.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', function () {
+            const chartDom = document.getElementById('earningsChart');
+            if (chartDom) {
+                const myChart = echarts.init(chartDom);
+                
+                const option = {
+                    animation: false,
+                    tooltip: {
+                        trigger: 'axis',
+                        backgroundColor: 'rgba(255, 255, 255, 0.9)',
+                        borderColor: '#e2e8f0',
+                        borderWidth: 1,
+                        textStyle: {
+                            color: '#1f2937'
+                        }
+                    },
+                    grid: {
+                        left: '3%',
+                        right: '3%',
+                        bottom: '3%',
+                        top: '3%',
+                        containLabel: true
+                    },
+                    xAxis: {
+                        type: 'category',
+                        boundaryGap: false,
+                        data: <?php echo json_encode($chart_dates); ?>,
+                        axisLine: {
+                            lineStyle: {
+                                color: '#e2e8f0'
+                            }
+                        },
+                        axisLabel: {
+                            color: '#6b7280'
+                        }
+                    },
+                    yAxis: {
+                        type: 'value',
+                        axisLine: {
+                            show: false
+                        },
+                        axisLabel: {
+                            color: '#6b7280'
+                        },
+                        splitLine: {
+                            lineStyle: {
+                                color: '#e2e8f0'
+                            }
+                        }
+                    },
+                    series: [
+                        {
+                            name: 'Daily Earnings',
+                            type: 'line',
+                            smooth: true,
+                            symbol: 'none',
+                            lineStyle: {
+                                width: 3,
+                                color: 'rgba(87, 181, 231, 1)'
+                            },
+                            areaStyle: {
+                                color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                                    { offset: 0, color: 'rgba(87, 181, 231, 0.2)' },
+                                    { offset: 1, color: 'rgba(87, 181, 231, 0.01)' }
+                                ])
+                            },
+                            data: <?php echo json_encode($chart_daily_earnings); ?>
+                        },
+                        {
+                            name: 'Referral Earnings',
+                            type: 'line',
+                            smooth: true,
+                            symbol: 'none',
+                            lineStyle: {
+                                width: 3,
+                                color: 'rgba(141, 211, 199, 1)'
+                            },
+                            areaStyle: {
+                                color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                                    { offset: 0, color: 'rgba(141, 211, 199, 0.2)' },
+                                    { offset: 1, color: 'rgba(141, 211, 199, 0.01)' }
+                                ])
+                            },
+                            data: <?php echo json_encode($chart_referral_earnings); ?>
+                        }
+                    ]
+                };
+                
+                myChart.setOption(option);
+                
+                window.addEventListener('resize', function () {
+                    myChart.resize();
+                });
+            }
+        });
+    </script>
 </body>
 </html>

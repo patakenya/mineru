@@ -15,29 +15,40 @@ if (!isset($_SESSION['csrf_token'])) {
 
 // Fetch user data
 $user_id = $_SESSION['user_id'];
-$stmt = $pdo->prepare("SELECT full_name, email, account_status, referral_count FROM users WHERE user_id = ?");
+$stmt = $pdo->prepare("SELECT full_name, email, phone_number, account_status FROM users WHERE user_id = ?");
 $stmt->execute([$user_id]);
-$user = $stmt->fetch();
+$user = $stmt->fetch(PDO::FETCH_ASSOC);
 if (!$user || $user['account_status'] !== 'active') {
     session_destroy();
     header('Location: login.php');
     exit;
 }
 
+// Fetch referral count
+$stmt = $pdo->prepare("SELECT COUNT(*) as referral_count FROM referrals WHERE referrer_id = ? AND status = 'active'");
+$stmt->execute([$user_id]);
+$referral_count = $stmt->fetchColumn() ?: 0;
+
 // Fetch balance data
 $stmt = $pdo->prepare("SELECT available_balance, pending_balance, total_withdrawn FROM user_balances WHERE user_id = ?");
 $stmt->execute([$user_id]);
-$balance = $stmt->fetch() ?: ['available_balance' => 0.00, 'pending_balance' => 0.00, 'total_withdrawn' => 0.00];
+$balance = $stmt->fetch(PDO::FETCH_ASSOC);
+if (!$balance) {
+    // Insert default balance record if none exists
+    $stmt = $pdo->prepare("INSERT INTO user_balances (user_id, available_balance, pending_balance, total_withdrawn) VALUES (?, 0.00, 0.00, 0.00)");
+    $stmt->execute([$user_id]);
+    $balance = ['available_balance' => 0.00, 'pending_balance' => 0.00, 'total_withdrawn' => 0.00];
+}
 
 // Fetch recent withdrawal transactions
 $stmt = $pdo->prepare("SELECT transaction_id, type, amount, method, status, transaction_hash, created_at FROM transactions WHERE user_id = ? AND type = 'withdrawal' ORDER BY created_at DESC LIMIT 5");
 $stmt->execute([$user_id]);
-$transactions = $stmt->fetchAll();
+$transactions = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Handle withdrawal form submission
 $error = '';
 $success = '';
-$form_data = ['amount' => '', 'method' => ''];
+$form_data = ['amount' => ''];
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['submit_withdrawal'])) {
     // Validate CSRF token
     if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
@@ -45,11 +56,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['submit_withdrawal']))
         error_log('CSRF Token Mismatch: Submitted=' . ($_POST['csrf_token'] ?? 'none') . ', Expected=' . $_SESSION['csrf_token']);
     } else {
         $form_data['amount'] = filter_input(INPUT_POST, 'amount', FILTER_VALIDATE_FLOAT);
-        $form_data['method'] = filter_input(INPUT_POST, 'method', FILTER_SANITIZE_STRING);
 
         // Validate inputs
-        $valid_methods = ['USDT (TRC20)', 'Bitcoin (BTC)', 'Ethereum (ETH)', 'MPESA'];
-        if ($user['referral_count'] < 3) {
+        if (!$user['phone_number'] || !preg_match('/^\+254[0-9]{9}$/', $user['phone_number'])) {
+            $error = 'A valid registered phone number (e.g., +254712345678) is required for MPESA withdrawals. Please update your profile.';
+        } elseif ($referral_count < 3) {
             $error = 'You need at least 3 referrals to withdraw funds.';
         } elseif (!$form_data['amount'] || $form_data['amount'] <= 0) {
             $error = 'Please enter a valid withdrawal amount.';
@@ -57,18 +68,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['submit_withdrawal']))
             $error = 'Minimum withdrawal amount is $10.00.';
         } elseif ($form_data['amount'] > $balance['available_balance']) {
             $error = 'Insufficient available balance.';
-        } elseif (!in_array($form_data['method'], $valid_methods)) {
-            $error = 'Invalid withdrawal method selected.';
         } else {
             try {
                 $pdo->beginTransaction();
 
-                // Generate a transaction hash (placeholder)
+                // Generate a transaction hash
                 $transaction_hash = 'TX_WD_' . bin2hex(random_bytes(8));
 
                 // Insert transaction (pending)
-                $stmt = $pdo->prepare("INSERT INTO transactions (user_id, type, amount, method, status, transaction_hash, created_at) VALUES (?, 'withdrawal', ?, ?, 'pending', ?, NOW())");
-                $stmt->execute([$user_id, -$form_data['amount'], $form_data['method'], $transaction_hash]);
+                $stmt = $pdo->prepare("INSERT INTO transactions (user_id, type, amount, method, status, transaction_hash, created_at) VALUES (?, 'withdrawal', ?, 'MPESA', 'pending', ?, NOW())");
+                $stmt->execute([$user_id, -$form_data['amount'], $transaction_hash]);
 
                 // Update pending balance
                 $stmt = $pdo->prepare("UPDATE user_balances SET pending_balance = pending_balance + ? WHERE user_id = ?");
@@ -79,13 +88,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['submit_withdrawal']))
                 // Regenerate CSRF token
                 $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 
-                $success = 'Withdrawal request submitted successfully! Awaiting confirmation.';
-                $form_data = ['amount' => '', 'method' => ''];
+                $success = 'Withdrawal request submitted successfully to MPESA number ' . htmlspecialchars($user['phone_number']) . '! Awaiting confirmation.';
+                $form_data = ['amount' => ''];
 
                 // Refresh transactions
                 $stmt = $pdo->prepare("SELECT transaction_id, type, amount, method, status, transaction_hash, created_at FROM transactions WHERE user_id = ? AND type = 'withdrawal' ORDER BY created_at DESC LIMIT 5");
                 $stmt->execute([$user_id]);
-                $transactions = $stmt->fetchAll();
+                $transactions = $stmt->fetchAll(PDO::FETCH_ASSOC);
             } catch (Exception $e) {
                 $pdo->rollBack();
                 $error = 'Withdrawal request failed: ' . htmlspecialchars($e->getMessage());
@@ -120,7 +129,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['submit_withdrawal']))
                 <div class="flex flex-wrap items-center justify-between">
                     <div>
                         <h1 class="text-2xl font-semibold text-gray-800 mb-2">Withdraw Funds</h1>
-                        <p class="text-gray-600 text-sm max-w-xl">Request a withdrawal from your available balance. Current balance: <span class="font-medium text-primary">$<?php echo number_format($balance['available_balance'], 2); ?></span></p>
+                        <p class="text-gray-600 text-sm max-w-xl">Request a withdrawal from your available balance to your registered MPESA number. Current balance: <span class="font-medium text-primary">$<?php echo number_format($balance['available_balance'], 2); ?></span></p>
                     </div>
                     <a href="wallet.php" class="bg-primary text-white px-5 py-2.5 rounded-button font-medium hover:bg-blue-600 transition-colors whitespace-nowrap">
                         <i class="ri-wallet-line mr-1"></i> Wallet Overview
@@ -163,25 +172,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['submit_withdrawal']))
                                     <button type="button" class="h-full px-3 text-xs text-primary font-medium bg-blue-50 rounded-r-button whitespace-nowrap" onclick="this.form.amount.value = <?php echo floor($balance['available_balance'] * 100) / 100; ?>">MAX</button>
                                 </div>
                             </div>
-                            <p class="mt-1 text-xs text-gray-500">Minimum withdrawal: $10.00. Referrals: <?php echo $user['referral_count']; ?>/3</p>
+                            <p class="mt-1 text-xs text-gray-500">Minimum withdrawal: $10.00. Referrals: <?php echo $referral_count; ?>/3</p>
                         </div>
                         
                         <div class="mb-4">
-                            <label class="block text-sm font-medium text-gray-700 mb-1">Withdrawal Method</label>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">MPESA Phone Number</label>
                             <div class="relative">
-                                <select name="method" required class="block w-full py-2 pl-3 pr-8 border border-gray-300 rounded-button appearance-none focus:ring-2 focus:ring-primary focus:ring-opacity-20 focus:outline-none text-sm">
-                                    <option value="" disabled <?php echo $form_data['method'] === '' ? 'selected' : ''; ?>>Select a method</option>
-                                    <?php foreach (['USDT (TRC20)', 'Bitcoin (BTC)', 'Ethereum (ETH)', 'MPESA'] as $method): ?>
-                                        <option value="<?php echo $method; ?>" <?php echo $form_data['method'] === $method ? 'selected' : ''; ?>><?php echo $method; ?></option>
-                                    <?php endforeach; ?>
-                                </select>
+                                <input type="text" value="<?php echo htmlspecialchars($user['phone_number'] ?: 'No number registered'); ?>" readonly class="block w-full py-2 pl-3 pr-8 border border-gray-300 rounded-button bg-gray-100 text-sm cursor-not-allowed">
                                 <div class="absolute inset-y-0 right-0 flex items-center px-2 pointer-events-none">
-                                    <i class="ri-arrow-down-s-line text-gray-400"></i>
+                                    <i class="ri-phone-line text-gray-400"></i>
                                 </div>
                             </div>
+                            <p class="mt-1 text-xs text-gray-500">Withdrawals will be sent to your registered MPESA number. <a href="profile.php" class="text-primary hover:underline">Update number</a></p>
                         </div>
                         
-                        <button type="submit" name="submit_withdrawal" class="w-full bg-primary text-white py-2.5 rounded-button font-medium hover:bg-blue-600 transition-colors whitespace-nowrap <?php echo $user['referral_count'] < 3 || $balance['available_balance'] < 10 ? 'opacity-50 cursor-not-allowed' : ''; ?>" <?php echo $user['referral_count'] < 3 || $balance['available_balance'] < 10 ? 'disabled' : ''; ?>>Submit Withdrawal</button>
+                        <button type="submit" name="submit_withdrawal" class="w-full bg-primary text-white py-2.5 rounded-button font-medium hover:bg-blue-600 transition-colors whitespace-nowrap <?php echo $referral_count < 3 || $balance['available_balance'] < 10 || !$user['phone_number'] ? 'opacity-50 cursor-not-allowed' : ''; ?>" <?php echo $referral_count < 3 || $balance['available_balance'] < 10 || !$user['phone_number'] ? 'disabled' : ''; ?>>Submit Withdrawal</button>
                     </form>
                 </div>
             </div>
