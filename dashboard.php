@@ -90,11 +90,23 @@ try {
     }
 
     // Ensure referral code exists
-    if (empty($user['referral_code'])) {
-        $referral_code = strtoupper(substr(md5(uniqid(rand(), true)), 0, 10));
-        $stmt = $pdo->prepare("UPDATE users SET referral_code = ? WHERE user_id = ?");
-        $stmt->execute([$referral_code, $user_id]);
-        $user['referral_code'] = $referral_code;
+    $referral_code = $user['referral_code'] ?? null;
+    if (empty($referral_code)) {
+        try {
+            $referral_code = 'REF' . str_pad($user_id, 7, '0', STR_PAD_LEFT); // e.g., REF0000001
+            $stmt = $pdo->prepare("UPDATE users SET referral_code = ? WHERE user_id = ?");
+            if ($stmt->execute([$referral_code, $user_id])) {
+                $user['referral_code'] = $referral_code;
+            } else {
+                error_log("Failed to update referral_code for user_id: $user_id");
+                $referral_code = 'TEMP' . $user_id; // Fallback
+                $user['referral_code'] = $referral_code;
+            }
+        } catch (PDOException $e) {
+            error_log("Referral Code Update Error: " . $e->getMessage());
+            $referral_code = 'TEMP' . $user_id; // Fallback
+            $user['referral_code'] = $referral_code;
+        }
     }
 
     // Fetch balance data
@@ -110,12 +122,12 @@ try {
     // Fetch pending balance
     $stmt = $pdo->prepare("SELECT SUM(amount) as pending_balance FROM transactions WHERE user_id = ? AND type = 'withdrawal' AND status = 'pending'");
     $stmt->execute([$user_id]);
-    $pending_balance = $stmt->fetch(PDO::FETCH_ASSOC)['pending_balance'] ?: 0.00;
+    $pending_balance = abs($stmt->fetch(PDO::FETCH_ASSOC)['pending_balance'] ?: 0.00);
 
     // Fetch total withdrawn
     $stmt = $pdo->prepare("SELECT SUM(amount) as total_withdrawn FROM transactions WHERE user_id = ? AND type = 'withdrawal' AND status = 'completed'");
     $stmt->execute([$user_id]);
-    $total_withdrawn = $stmt->fetch(PDO::FETCH_ASSOC)['total_withdrawn'] ?: 0.00;
+    $total_withdrawn = abs($stmt->fetch(PDO::FETCH_ASSOC)['total_withdrawn'] ?: 0.00);
 
     // Fetch total investment
     $stmt = $pdo->prepare("SELECT SUM(mp.price) as total_investment FROM user_miners um JOIN mining_packages mp ON um.package_id = mp.package_id WHERE um.user_id = ?");
@@ -212,13 +224,13 @@ try {
     <main class="container mx-auto px-4 py-6">
         <!-- Messages -->
         <?php if ($error): ?>
-            <div class="mb-4 p-3 bg-red-50 text-red-600 text-sm rounded-button flex items-center">
+            <div class="mb-4 p-3 bg-red-50 text-red-600 text-sm rounded-button flex items-center justify-center">
                 <i class="ri-error-warning-line mr-2"></i>
                 <?php echo htmlspecialchars($error); ?>
             </div>
         <?php endif; ?>
         <?php if ($success): ?>
-            <div class="mb-4 p-3 bg-green-50 text-green-600 text-sm rounded-button flex items-center">
+            <div class="mb-4 p-3 bg-green-50 text-green-600 text-sm rounded-button flex items-center justify-center">
                 <i class="ri-check-line mr-2"></i>
                 <?php echo htmlspecialchars($success); ?>
             </div>
@@ -365,7 +377,7 @@ try {
                                     <form method="POST" action="">
                                         <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
                                         <input type="hidden" name="package_id" value="<?php echo $package['package_id']; ?>">
-                                        <button type="submit" name="purchase_miner" class="block w-full bg-primary text-white py-2.5 rounded-button font-medium hover:bg-blue-600 transition-colors text-center">
+                                        <button type="submit" name="purchase_miner" class="block w-full bg-primary text-white py-2.5 rounded-button font-medium hover:bg-blue-600 transition-colors text-center <?php echo $balance['available_balance'] < $package['price'] ? 'opacity-50 cursor-not-allowed' : ''; ?>" <?php echo $balance['available_balance'] < $package['price'] ? 'disabled' : ''; ?>>
                                             Purchase Now
                                         </button>
                                     </form>
@@ -449,58 +461,10 @@ try {
             </div>
         </section>
 
-        <!-- Referral Section -->
-        <section id="referrals" class="mb-8 grid grid-cols-1 lg:grid-cols-3 gap-6">
-            <div class="lg:col-span-1">
-                <div class="bg-white rounded-lg shadow-sm p-6 h-full">
-                    <h2 class="text-xl font-semibold text-gray-800 mb-4">Referral Progress</h2>
-                    
-                    <div class="mb-6">
-                        <div class="flex items-center justify-between mb-2">
-                            <span class="text-sm text-gray-600">Referral Requirement</span>
-                            <span class="text-sm font-medium text-primary"><?php echo $referral_count; ?>/3</span>
-                        </div>
-                        <div class="w-full bg-gray-200 rounded-full h-2.5">
-                            <div class="bg-primary h-2.5 rounded-full" style="width: <?php echo $referral_progress; ?>%"></div>
-                        </div>
-                        <p class="mt-2 text-xs text-gray-500"><?php echo 3 - $referral_count; ?> more referral<?php echo (3 - $referral_count) !== 1 ? 's' : ''; ?> to enable MPESA withdrawals</p>
-                    </div>
-                    
-                    <div class="mb-6">
-                        <h3 class="text-sm font-medium text-gray-700 mb-3">Your Referral Link</h3>
-                        <div class="flex">
-                            <input type="text" id="referralLink" value="http://localhost/miner/register.php?ref=<?php echo htmlspecialchars($user['referral_code']); ?>" readonly class="flex-1 border border-gray-300 rounded-l-button py-2 px-3 text-sm bg-gray-50 focus:outline-none">
-                            <button id="copyLinkBtn" class="bg-primary text-white px-4 rounded-r-button hover:bg-blue-600 transition-colors whitespace-nowrap">
-                                <i class="ri-file-copy-line"></i>
-                            </button>
-                        </div>
-                    </div>
-                    
-                    <div>
-                        <h3 class="text-sm font-medium text-gray-700 mb-3">Share Your Link</h3>
-                        <div class="flex space-x-2">
-                            <?php $referral_url = 'http://localhost/miner/register.php?ref=' . urlencode($user['referral_code']); ?>
-                            <a href="https://www.facebook.com/sharer/sharer.php?u=<?php echo htmlspecialchars(urlencode($referral_url)); ?>" target="_blank" class="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center text-blue-600 hover:bg-blue-100 transition-colors" aria-label="Share on Facebook">
-                                <i class="ri-facebook-fill"></i>
-                            </a>
-                            <a href="https://twitter.com/intent/tweet?url=<?php echo htmlspecialchars(urlencode($referral_url)); ?>&text=Join%20CryptoMiner%20ERP%20and%20start%20mining!" target="_blank" class="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center text-blue-400 hover:bg-blue-100 transition-colors" aria-label="Share on Twitter">
-                                <i class="ri-twitter-fill"></i>
-                            </a>
-                            <a href="https://api.whatsapp.com/send?text=Join%20CryptoMiner%20ERP%20and%20start%20mining!%20<?php echo htmlspecialchars(urlencode($referral_url)); ?>" target="_blank" class="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center text-green-500 hover:bg-blue-100 transition-colors" aria-label="Share on WhatsApp">
-                                <i class="ri-whatsapp-fill"></i>
-                            </a>
-                            <a href="https://t.me/share/url?url=<?php echo htmlspecialchars(urlencode($referral_url)); ?>&text=Join%20CryptoMiner%20ERP%20and%20start%20mining!" target="_blank" class="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center text-blue-700 hover:bg-blue-100 transition-colors" aria-label="Share on Telegram">
-                                <i class="ri-telegram-fill"></i>
-                            </a>
-                            <a href="mailto:?subject=Join%20CryptoMiner%20ERP!&body=Start%20mining%20with%20CryptoMiner%20ERP:%20<?php echo htmlspecialchars(urlencode($referral_url)); ?>" class="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center text-red-500 hover:bg-blue-100 transition-colors" aria-label="Share via Email">
-                                <i class="ri-mail-fill"></i>
-                            </a>
-                        </div>
-                    </div>
-                </div>
-            </div>
+        
+        <section id="transactions" class="mb-8">
+
             
-            <div class="lg:col-span-2">
                 <div class="bg-white rounded-lg shadow-sm p-6">
                     <h2 class="text-xl font-semibold text-gray-800 mb-6">Recent Transactions</h2>
                     
@@ -527,7 +491,7 @@ try {
                                         <tr>
                                             <td class="px-4 py-4 whitespace-nowrap">
                                                 <div class="flex items-center">
-                                                    <div class="w-8 h-8 rounded-full bg-<?php echo $tx['type'] === 'deposit' ? 'green' : ($tx['type'] === 'withdrawal' ? 'red' : ($tx['type'] === 'referral' ? 'purple' : 'blue')); ?>-100 flex items-center justify-center mr-3">
+                                                    <div class="w-8 h-8 rounded-full bg-<?php echo $tx['type'] === 'deposit' ? 'green' : ($tx['type'] === 'withdrawal' ? 'red' : ($tx['type'] === 'referral' ? 'purple' : ($tx['type'] === 'purchase' ? 'blue' : 'blue'))); ?>-100 flex items-center justify-center mr-3">
                                                         <i class="ri-<?php echo $tx['type'] === 'deposit' ? 'arrow-down' : ($tx['type'] === 'withdrawal' ? 'arrow-up' : ($tx['type'] === 'referral' ? 'user-add' : ($tx['type'] === 'purchase' ? 'shopping-cart' : 'coins'))); ?>-line text-<?php echo $tx['type'] === 'deposit' ? 'green' : ($tx['type'] === 'withdrawal' ? 'red' : ($tx['type'] === 'referral' ? 'purple' : ($tx['type'] === 'purchase' ? 'blue' : 'blue'))); ?>-600"></i>
                                                     </div>
                                                     <div>
@@ -558,7 +522,7 @@ try {
                         </table>
                     </div>
                 </div>
-            </div>
+            
         </section>
 
         <!-- Wallet Section -->
@@ -641,6 +605,23 @@ try {
     <script src="scripts.js"></script>
     <script>
         document.addEventListener('DOMContentLoaded', function () {
+            const copyLinkBtn = document.getElementById('copyLinkBtn');
+            const referralLink = document.getElementById('referralLink');
+            if (copyLinkBtn && referralLink) {
+                copyLinkBtn.addEventListener('click', function () {
+                    referralLink.select();
+                    try {
+                        document.execCommand('copy');
+                        copyLinkBtn.innerHTML = '<i class="ri-check-line"></i>';
+                        setTimeout(() => {
+                            copyLinkBtn.innerHTML = '<i class="ri-file-copy-line"></i>';
+                        }, 2000);
+                    } catch (err) {
+                        console.error('Failed to copy: ', err);
+                    }
+                });
+            }
+
             const chartDom = document.getElementById('earningsChart');
             if (chartDom) {
                 const myChart = echarts.init(chartDom);

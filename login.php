@@ -54,7 +54,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $location = 'Unknown'; // Implement geolocation API if needed
                     $stmt->execute([$user['user_id'], $device, substr($browser, 0, 50), $ip, $location]);
 
-                    header('Location: index.php');
+                    header('Location: dashboard.php');
                     exit;
                 }
             } else {
